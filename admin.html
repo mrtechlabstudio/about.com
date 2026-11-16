@@ -258,16 +258,16 @@
   <script type="module">
     import { initializeApp, deleteApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
-    import { getDatabase, ref, onValue, get, push, set } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
-    import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-functions.js";
+    import { getDatabase, ref, onValue, get, push, update, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
 
+    const DEFAULT_DB_URL = "https://ff-voyes-default-rtdb.firebaseio.com";
     const BASE_CONFIG = {
-      apiKey: "AIzaSyCCZGecBch0zqJBJmlV0q2uP-715ggpTfI",
+      apiKey: "AIzaSyAwBWrKGJ9Kr2wwUfJKKXelbx5-cK_qV8s",
       authDomain: "ff-voyes.firebaseapp.com",
       projectId: "ff-voyes",
       storageBucket: "ff-voyes.firebasestorage.app",
       messagingSenderId: "546957487301",
-      appId: "1:546957487301:web:a515479215fce24178d4ac"
+      appId: "1:546957487301:android:e02182a016b0fe3978d4ac"
     };
 
     const FEATURES = [
@@ -279,7 +279,7 @@
       { key: "advanced_export", label: "Advanced Export" }
     ];
 
-    let app = null, auth = null, db = null, functions = null;
+    let app = null, auth = null, db = null;
     let allUsers = [];
     let filteredUsers = [];
     let currentPage = 1;
@@ -287,7 +287,7 @@
     let selectedUid = null;
     let serverOffsetMs = 0;
 
-    const savedDbUrl = localStorage.getItem("mr_ff_voyes_rtdb_url") || "";
+    const savedDbUrl = localStorage.getItem("mr_ff_voyes_rtdb_url") || DEFAULT_DB_URL;
     const inputDbUrl = document.getElementById("inputDbUrl");
     inputDbUrl.value = savedDbUrl;
 
@@ -304,7 +304,6 @@
       app = initializeApp(cfg);
       auth = getAuth(app);
       db = getDatabase(app);
-      functions = getFunctions(app);
       onValue(ref(db, ".info/serverTimeOffset"), snap => {
         serverOffsetMs = Number(snap.val() || 0);
       });
@@ -411,9 +410,11 @@
       const features = access.features || {};
       const lockedAccount = access.accountLocked === true;
 
+      const trialStart = trial.startTimeMs || 0;
+      const computedExpiry = trial.expiryTimeMs || (trialStart > 0 ? trialStart + 86400000 : 0);
       let trialState = "NONE";
-      if (trial.expiryTimeMs) {
-        trialState = now < trial.expiryTimeMs ? "ACTIVE" : "EXPIRED";
+      if (computedExpiry > 0) {
+        trialState = now < computedExpiry ? "ACTIVE" : "EXPIRED";
       }
 
       let adminGranted = 0, activeCount = 0, expiredCount = 0;
@@ -453,7 +454,7 @@
         adminGranted,
         activeCount,
         accessBucket,
-        nextExpiry: nextExpiry || (trialState === "ACTIVE" ? trial.expiryTimeMs : 0),
+        nextExpiry: nextExpiry || (trialState === "ACTIVE" ? computedExpiry : 0),
         history: data.accessHistory ? Object.values(data.accessHistory) : []
       };
     }
@@ -552,16 +553,111 @@
         : "No administrator history recorded yet.";
     }
 
+    function computeDurationMs(val, unit) {
+      const n = Number(val || 0);
+      if (!n || n <= 0) return 0;
+      const unitMs = {
+        minutes: 60 * 1000,
+        hours: 60 * 60 * 1000,
+        days: 24 * 60 * 60 * 1000,
+        months: 30 * 24 * 60 * 60 * 1000,
+        years: 365 * 24 * 60 * 60 * 1000
+      };
+      return n * (unitMs[unit] || 0);
+    }
+
     async function callAdminAction(targetUid, action, featureKeys) {
+      if (!targetUid) return;
       const durationValue = Number(document.getElementById("durationVal").value || 0);
       const durationUnit = document.getElementById("durationUnit").value;
       if (!confirm(`Confirm "${action}" for user ${targetUid}?`)) return;
+
       try {
-        const fn = httpsCallable(functions, "adminManageAccess");
-        await fn({ targetUid, action, featureKeys, durationValue, durationUnit });
-        showToast(`Action ${action} applied.`);
+        const now = trustedNow();
+        const deltaMs = computeDurationMs(durationValue, durationUnit);
+        const userSnap = await get(ref(db, `users/${targetUid}`));
+        const userData = userSnap.val() || {};
+        const currentAccess = userData.access || {};
+        const currentFeatures = currentAccess.features || {};
+        const updates = {};
+        const targetKeys = Array.isArray(featureKeys) && featureKeys.length
+          ? featureKeys
+          : FEATURES.map(f => f.key);
+
+        if (action === "LOCK_ACCOUNT") {
+          updates[`users/${targetUid}/access/accountLocked`] = true;
+        } else if (action === "UNLOCK_ACCOUNT") {
+          updates[`users/${targetUid}/access/accountLocked`] = false;
+        } else if (action === "GRANT") {
+          const expiresAtMs = deltaMs > 0 ? now + deltaMs : 0;
+          updates[`users/${targetUid}/access/accountLocked`] = false;
+          for (const key of targetKeys) {
+            updates[`users/${targetUid}/access/features/${key}`] = {
+              status: "ADMIN_GRANTED",
+              grantedAtMs: now,
+              expiresAtMs,
+              grantedBy: auth.currentUser ? auth.currentUser.uid : "admin"
+            };
+          }
+        } else if (action === "EXTEND") {
+          if (deltaMs <= 0) {
+            showToast("Enter a duration > 0 to extend.");
+            return;
+          }
+          for (const key of targetKeys) {
+            const existing = currentFeatures[key] || {};
+            const base = (existing.expiresAtMs && existing.expiresAtMs > now) ? existing.expiresAtMs : now;
+            updates[`users/${targetUid}/access/features/${key}`] = {
+              status: "ADMIN_GRANTED",
+              grantedAtMs: existing.grantedAtMs || now,
+              expiresAtMs: base + deltaMs,
+              grantedBy: auth.currentUser ? auth.currentUser.uid : "admin"
+            };
+          }
+        } else if (action === "REVOKE" || action === "LOCK_FEATURE") {
+          for (const key of targetKeys) {
+            updates[`users/${targetUid}/access/features/${key}`] = {
+              status: "LOCKED",
+              grantedAtMs: now,
+              expiresAtMs: now,
+              grantedBy: auth.currentUser ? auth.currentUser.uid : "admin"
+            };
+          }
+        }
+
+        const histKey = push(ref(db, `users/${targetUid}/accessHistory`)).key;
+        updates[`users/${targetUid}/accessHistory/${histKey}`] = {
+          action,
+          featureKeys: targetKeys,
+          durationValue,
+          durationUnit,
+          adminUid: auth.currentUser ? auth.currentUser.uid : "admin",
+          timestampMs: now
+        };
+
+        const notifKey = push(ref(db, `users/${targetUid}/notifications`)).key;
+        updates[`users/${targetUid}/notifications/${notifKey}`] = {
+          title: `Account Access Update: ${action}`,
+          message: action === "LOCK_ACCOUNT"
+            ? "Your premium features have been locked by an administrator."
+            : (action === "GRANT" || action === "EXTEND"
+              ? `Administrator granted ${targetKeys.join(", ")} access.`
+              : `Feature access updated (${action}).`),
+          type: "ADMIN",
+          timestampMs: now,
+          read: false
+        };
+
+        updates[`accessRecords/${targetUid}`] = {
+          lastAction: action,
+          updatedBy: auth.currentUser ? auth.currentUser.uid : "admin",
+          updatedAtMs: serverTimestamp()
+        };
+
+        await update(ref(db), updates);
+        showToast(`Action ${action} applied directly via RTDB.`);
       } catch (e) {
-        showToast("Backend error: " + e.message);
+        showToast("Database write error: " + e.message);
       }
     }
 
